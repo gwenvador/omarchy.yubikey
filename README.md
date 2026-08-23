@@ -14,7 +14,7 @@ Omarchy theme, font, and spacing with no styling of its own.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/<you>/omarchy-yubikey.git --enable
+omarchy plugin add https://github.com/eusener/omarchy-yubikey.git --enable
 ```
 
 Third-party plugins are disabled on arrival; `--enable` handles that, or run
