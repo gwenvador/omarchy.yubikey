@@ -1,0 +1,948 @@
+#!/bin/bash
+
+# omarchy-yubikey — inspect and configure YubiKeys for this machine.
+#
+# The panel holds no state: every read command re-derives its answer from the
+# key itself (`ykman`), from /etc/pam.d, or from ~/.ssh, so the UI can never
+# drift from the system. Everything that needs a touch, a PIN, or a password
+# is deliberately NOT run from the shell process — those subcommands are
+# marked `terminal` and the panel spawns them in xdg-terminal-exec, the same
+# way `omarchy setup security fido2` works. A GUI cannot honestly prompt for a
+# PIV management key, and a silent pkexec cannot prompt for a touch.
+#
+# PAM edits follow the conventions omarchy-setup-security-fido2 already
+# established: `auth sufficient pam_u2f.so cue authfile=/etc/fido2/fido2`
+# prepended to a stack. `sufficient` is the only line type written here — if
+# pam_u2f.so is missing or the key is absent, the stack falls through to the
+# password instead of locking anyone out.
+
+set -o pipefail
+
+FIDO2_AUTHFILE="/etc/fido2/fido2"
+PAM_MARK="pam_u2f.so"
+SSH_DIR="$HOME/.ssh"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+# ---------------------------------------------------------------- helpers
+
+has() { command -v "$1" >/dev/null 2>&1; }
+
+# sudo when a terminal is here to take the password, pkexec when the caller is
+# the shell process and there is nowhere to type it.
+as_root() {
+  if [[ -t 0 ]]; then sudo "$@"; else pkexec "$@"; fi
+}
+
+die() { echo "omarchy-yubikey: $*" >&2; exit 1; }
+
+# jq's `true`/`false` from a shell exit status.
+jbool() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
+
+# ykman prints to stderr and exits non-zero when no key is present; every
+# reader here tolerates that and reports absence rather than failing.
+yk() { ykman "$@" 2>/dev/null; }
+
+require_ykman() {
+  has ykman || die "ykman is not installed. Run: omarchy-yubikey install-deps"
+}
+
+# ------------------------------------------------------------- dependencies
+#
+# bin:pkg:why — the panel renders this straight into its Setup page, so the
+# reason text is user-facing.
+DEPS=(
+  "ykman:yubikey-manager:Read the key, toggle applets, manage PINs and TOTP accounts"
+  "fido2-token:libfido2:Talk to the FIDO2 applet (SSH security keys, LUKS)"
+  "pamu2fcfg:pam-u2f:Register the key with PAM for sudo, polkit, login, and lock"
+  "pcscd:pcsclite:Smartcard daemon required by the PIV and OpenPGP applets"
+  "yubico-piv-tool:yubico-piv-tool:Manage PIV certificates used for SSH and S/MIME"
+  "pkcs11-tool:opensc:PKCS#11 provider that lets OpenSSH use a PIV slot"
+  "gpg:gnupg:OpenPGP applet, and gpg-agent as an SSH agent"
+  "ykpersonalize:yubikey-personalization:Configure the OTP slots (Yubico OTP, static password)"
+)
+
+cmd_deps() {
+  local out="[]" bin pkg why present
+  for entry in "${DEPS[@]}"; do
+    bin=${entry%%:*}; entry=${entry#*:}
+    pkg=${entry%%:*}; why=${entry#*:}
+    present=$(jbool has "$bin")
+    out=$(jq -c --arg bin "$bin" --arg pkg "$pkg" --arg why "$why" --argjson present "$present" \
+      '. + [{bin:$bin, pkg:$pkg, why:$why, present:$present}]' <<<"$out")
+  done
+  jq -n --argjson deps "$out" \
+    --argjson pcscd "$(jbool systemctl is-active --quiet pcscd.socket)" \
+    '{deps:$deps,
+      missing: ($deps | map(select(.present | not)) | length),
+      pcscdRunning: $pcscd}'
+}
+
+cmd_install_deps() {
+  local pkgs=()
+  for entry in "${DEPS[@]}"; do
+    local bin=${entry%%:*}; entry=${entry#*:}
+    local pkg=${entry%%:*}
+    has "$bin" || pkgs+=("$pkg")
+  done
+  if [[ ${#pkgs[@]} -eq 0 ]]; then
+    echo "Everything is already installed."
+  else
+    echo "Installing: ${pkgs[*]}"
+    omarchy-pkg-add "${pkgs[@]}" || die "package install failed"
+  fi
+
+  # PIV and OpenPGP are dead without pcscd; enabling the socket is idempotent.
+  echo
+  echo "Enabling the smartcard daemon (pcscd.socket)..."
+  sudo systemctl enable --now pcscd.socket
+
+  echo
+  echo "Done. Close this window and reopen the YubiKey panel."
+}
+
+# ------------------------------------------------------------------ hardware
+#
+# `ykman info` is a human-readable report with no JSON mode, and its exact
+# wording drifts between ykman releases. Everything below matches loosely
+# (case-insensitive, on the label rather than the position) and falls back to
+# an empty string, so a wording change degrades one field instead of the page.
+
+field() { sed -nE "s/^[[:space:]]*$1[[:space:]]*:[[:space:]]*(.*)$/\1/Ip" <<<"$2" | head -1; }
+
+# The Applications block is a table: NAME <tab> USB-state <tab> NFC-state.
+# Rows are collected into {name: {usb, nfc}} without assuming which rows exist,
+# because that varies by model (a Security Key has no PIV or OATH at all).
+parse_applications() {
+  awk '
+    /^[Aa]pplications/ { intable = 1; next }
+    intable {
+      if ($0 ~ /^[[:space:]]*$/) { intable = 0; next }
+      line = $0
+      sub(/[[:space:]]{2,}.*$/, "", line)       # name is everything before the gap
+      rest = $0
+      sub(/^[^[:space:]].*?[[:space:]]{2,}/, "", rest)
+      n = split($0, cols, /\t|[[:space:]]{2,}/)
+      name = cols[1]; usb = (n >= 2 ? cols[2] : ""); nfc = (n >= 3 ? cols[3] : "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", usb)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", nfc)
+      if (name != "") printf "%s\t%s\t%s\n", name, usb, nfc
+    }
+  ' <<<"$1" | jq -R -s -c '
+    split("\n") | map(select(length > 0) | split("\t"))
+    | map({key: .[0], value: {usb: (.[1] // ""), nfc: (.[2] // "")}})
+    | from_entries'
+}
+
+device_json() {
+  local serial="$1" info
+  info=$(yk --device "$serial" info)
+  [[ -z $info ]] && info=$(yk info)
+
+  jq -n \
+    --arg serial "$serial" \
+    --arg name "$(field 'Device type' "$info")" \
+    --arg version "$(field 'Firmware version' "$info")" \
+    --arg form "$(field 'Form factor' "$info")" \
+    --arg interfaces "$(field 'Enabled USB interfaces' "$info")" \
+    --argjson nfc "$(if grep -qiE 'NFC transport is enabled' <<<"$info"; then echo true; else echo false; fi)" \
+    --argjson fips "$(if grep -qiE 'FIPS' <<<"$info"; then echo true; else echo false; fi)" \
+    --argjson apps "$(parse_applications "$info")" \
+    '{serial:$serial, name:$name, version:$version, formFactor:$form,
+      interfaces:$interfaces, nfc:$nfc, fips:$fips, applications:$apps}'
+}
+
+# Each applet reports its PIN state differently, none of them report it as
+# JSON, and the wording has changed across ykman releases. A missing applet
+# simply yields nulls rather than an error.
+
+# Two layouts in the wild for `ykman fido info`:
+#
+#   PIN:                          8 attempt(s) remaining     (5.x)
+#   PIN:                          Not set
+#
+#   PIN:                                                     (older)
+#     Status: Set
+#     Attempts remaining: 8
+#
+# So: read the PIN label and everything indented under it, then decide on
+# content rather than on position. "Not set" is the only reliable negative —
+# anything carrying a retry count or an explicit Set means a PIN exists.
+fido_pin_block() {
+  awk '
+    /^[[:space:]]*PIN[[:space:]]*:/ { found = 1; print; next }
+    found && /^[[:space:]]+/ { print; next }
+    found { exit }
+  ' <<<"$1"
+}
+
+fido_pin_set() {
+  local block; block=$(fido_pin_block "$1")
+  [[ -z $block ]] && { echo false; return; }
+  grep -qiE 'not[[:space:]]+set' <<<"$block" && { echo false; return; }
+  if grep -qiE 'status:[[:space:]]*set|[0-9]+[[:space:]]*attempt' <<<"$block"; then
+    echo true
+  else
+    echo false
+  fi
+}
+
+# The count sits before the words in 5.x and after a label in older releases,
+# so take the first number anywhere in the block rather than anchoring to
+# either side of "attempt".
+fido_pin_retries() {
+  fido_pin_block "$1" | grep -oE '[0-9]+' | head -1
+}
+
+pins_json() {
+  local fido piv pgp
+  fido=$(yk fido info)
+  piv=$(yk piv info)
+  pgp=$(yk openpgp info)
+
+  jq -n \
+    --argjson fidoSet "$(fido_pin_set "$fido")" \
+    --arg fidoRetries "$(fido_pin_retries "$fido")" \
+    --arg pivRetries "$(grep -oiE 'PIN tries remaining:[[:space:]]*[0-9]+' <<<"$piv" | grep -oE '[0-9]+' | head -1)" \
+    --arg pgpRetries "$(grep -oiE '^PIN tries remaining:[[:space:]]*[0-9]+' <<<"$pgp" | grep -oE '[0-9]+' | head -1)" \
+    --argjson pivPresent "$(if [[ -n $piv ]]; then echo true; else echo false; fi)" \
+    --argjson pgpPresent "$(if [[ -n $pgp ]]; then echo true; else echo false; fi)" \
+    --argjson pivDefaultPin "$(if grep -qiE 'Using default PIN' <<<"$piv"; then echo true; else echo false; fi)" \
+    --argjson pivDefaultPuk "$(if grep -qiE 'Using default PUK' <<<"$piv"; then echo true; else echo false; fi)" \
+    --argjson pivDefaultMgmt "$(if grep -qiE 'Using default Management key' <<<"$piv"; then echo true; else echo false; fi)" \
+    '{fido: {set:$fidoSet, retries:$fidoRetries},
+      piv:  {present:$pivPresent, retries:$pivRetries,
+             defaultPin:$pivDefaultPin, defaultPuk:$pivDefaultPuk,
+             defaultMgmt:$pivDefaultMgmt},
+      openpgp: {present:$pgpPresent, retries:$pgpRetries}}'
+}
+
+# PIV slots that already hold a certificate — these are what SSH can use.
+piv_slots_json() {
+  yk piv info | awk '
+    /^Slot [0-9a-fA-F]+/ {
+      slot = $2; sub(/:$/, "", slot)
+      label = $0
+      if (match(label, /\(([^)]*)\)/)) label = substr(label, RSTART + 1, RLENGTH - 2); else label = ""
+      printf "%s\t%s\n", slot, label
+    }
+  ' | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {slot: .[0], name: (.[1] // "")})'
+}
+
+# A presence check cheap enough to poll. `ykman list` spawns a Python
+# interpreter and takes the better part of a second; sysfs answers instantly and
+# needs nothing installed, which also makes it the honest check to run before
+# telling someone their tooling is broken. 0x1050 is Yubico.
+cmd_present() {
+  local vid
+  for vid in /sys/bus/usb/devices/*/idVendor; do
+    [[ -r $vid ]] || continue
+    if [[ $(<"$vid") == "1050" ]]; then echo yes; return 0; fi
+  done
+  echo no
+}
+
+cmd_status() {
+  if ! has ykman; then
+    jq -n '{present:false, count:0, devices:[], pins:{}, pivSlots:[], missingTool:true}'
+    return 0
+  fi
+  local serials devices="[]"
+  serials=$(yk list --serials)
+
+  if [[ -n $serials ]]; then
+    while read -r s; do
+      [[ -z $s ]] && continue
+      devices=$(jq -c --argjson d "$(device_json "$s")" '. + [$d]' <<<"$devices")
+    done <<<"$serials"
+  fi
+
+  jq -n \
+    --argjson devices "$devices" \
+    --argjson pins "$(if [[ -n $serials ]]; then pins_json; else echo '{}'; fi)" \
+    --argjson slots "$(if [[ -n $serials ]]; then piv_slots_json; else echo '[]'; fi)" \
+    '{present: ($devices | length > 0), count: ($devices | length),
+      devices:$devices, pins:$pins, pivSlots:$slots, missingTool:false}'
+}
+
+# `ykman info` prints display names ("Yubico OTP") while `ykman config usb`
+# takes short keys ("otp"), and the two lists are not derivable from each
+# other. Accept either, so callers can pass through whatever the status output
+# gave them without knowing about the split.
+applet_key() {
+  case "$(tr '[:upper:]' '[:lower:]' <<<"$1")" in
+    otp|"yubico otp")     echo otp ;;
+    u2f|"fido u2f")       echo u2f ;;
+    fido2)                echo fido2 ;;
+    oath)                 echo oath ;;
+    piv)                  echo piv ;;
+    openpgp|"open pgp")   echo openpgp ;;
+    hsmauth|"yubihsm auth") echo hsmauth ;;
+    *) return 1 ;;
+  esac
+}
+
+# `ykman config usb` refuses without --force when it would drop the transport
+# the command itself arrived over; --force is what the panel's confirmation
+# dialog stands in for.
+cmd_app() {
+  require_ykman
+  local app key state="$2" transport="${3:-usb}"
+  app="$1"
+  key=$(applet_key "$app") || die "unknown applet '$app'"
+  case "$state" in
+    on)  ykman config "$transport" --enable "$key" --force ;;
+    off) ykman config "$transport" --disable "$key" --force ;;
+    *)   die "app: state must be on or off" ;;
+  esac
+}
+
+# --------------------------------------------------------------- PAM / login
+#
+# Four stacks, one shape. `lock` is Omarchy's own lock-screen stack rather than
+# a hyprlock file, because the shell's lock plugin hardcodes the PAM service
+# names it will talk to (omarchy-lock-password / omarchy-lock-fingerprint).
+
+pam_file_for() {
+  case "$1" in
+    sudo)   echo /etc/pam.d/sudo ;;
+    polkit) echo /etc/pam.d/polkit-1 ;;
+    login)  echo /etc/pam.d/login ;;
+    lock)   echo /etc/pam.d/omarchy-lock-password ;;
+    *) return 1 ;;
+  esac
+}
+
+PAM_SERVICES=(sudo polkit login lock)
+
+pam_line() { echo "auth      sufficient pam_u2f.so cue authfile=$FIDO2_AUTHFILE"; }
+
+cmd_pam_status() {
+  local out="[]" file enabled exists
+  for svc in "${PAM_SERVICES[@]}"; do
+    file=$(pam_file_for "$svc")
+    exists=$(jbool test -f "$file")
+    enabled=false
+    [[ -f $file ]] && grep -q "$PAM_MARK" "$file" && enabled=true
+    out=$(jq -c --arg svc "$svc" --arg file "$file" --argjson enabled "$enabled" --argjson exists "$exists" \
+      '. + [{service:$svc, file:$file, enabled:$enabled, exists:$exists}]' <<<"$out")
+  done
+
+  # The authfile is root-owned but world-readable, so counting registrations
+  # needs no escalation. One non-comment line per registered credential.
+  local keys=0
+  # Same grep -c caveat as above: read the count, discard the status.
+  [[ -r $FIDO2_AUTHFILE ]] && keys=$(grep -cvE '^[[:space:]]*(#|$)' "$FIDO2_AUTHFILE" 2>/dev/null)
+
+  jq -n --argjson services "$out" --argjson keys "${keys:-0}" \
+    --argjson registered "$(jbool test -s "$FIDO2_AUTHFILE")" \
+    --arg authfile "$FIDO2_AUTHFILE" \
+    '{services:$services, authfile:$authfile, registered:$registered, keyCount:$keys}'
+}
+
+# Runs as root, invoked once per change so the user sees one password prompt
+# instead of one per sed. Refuses to run unprivileged so it can never be
+# mistaken for the user-facing entry point.
+cmd_pam_write() {
+  [[ $EUID -eq 0 ]] || die "_pam-write is an internal root-only command"
+  local action="$1" svc="$2" file
+  file=$(pam_file_for "$svc") || die "unknown PAM service '$svc'"
+
+  case "$action" in
+    enable)
+      if [[ ! -f $file ]]; then
+        # Only polkit is safe to author from scratch; the rest belong to their
+        # own packages and a hand-written stack would be worse than none.
+        [[ $svc == polkit ]] || die "$file does not exist; refusing to create it"
+        cat >"$file" <<EOF
+$(pam_line)
+auth      required pam_unix.so
+
+account   required pam_unix.so
+password  required pam_unix.so
+session   required pam_unix.so
+EOF
+        return 0
+      fi
+      grep -q "$PAM_MARK" "$file" && return 0
+      cp -a "$file" "$file.omarchy-yubikey.bak"
+      sed -i "1i $(pam_line)" "$file"
+      # A truncated PAM stack is how people lose sudo. Restore on any doubt.
+      [[ -s $file ]] || { cp -a "$file.omarchy-yubikey.bak" "$file"; die "refused: $file came out empty"; }
+      ;;
+    disable)
+      [[ -f $file ]] || return 0
+      grep -q "$PAM_MARK" "$file" || return 0
+      cp -a "$file" "$file.omarchy-yubikey.bak"
+      sed -i "/$PAM_MARK/d" "$file"
+      [[ -s $file ]] || { cp -a "$file.omarchy-yubikey.bak" "$file"; die "refused: $file came out empty"; }
+      ;;
+    *) die "_pam-write: action must be enable or disable" ;;
+  esac
+}
+
+cmd_pam_enable()  { pam_file_for "$1" >/dev/null || die "unknown service '$1'"; as_root "$SELF" _pam-write enable "$1"; }
+cmd_pam_disable() { pam_file_for "$1" >/dev/null || die "unknown service '$1'"; as_root "$SELF" _pam-write disable "$1"; }
+
+# Terminal-only: pamu2fcfg blocks on a physical touch.
+cmd_pam_register() {
+  has pamu2fcfg || die "pam-u2f is not installed. Run: omarchy-yubikey install-deps"
+  echo -e "\e[32mRegistering this YubiKey with PAM.\e[0m"
+  echo "Touch the key when it starts blinking."
+  echo
+
+  local tmp; tmp=$(mktemp)
+  local first=true
+  [[ -s $FIDO2_AUTHFILE ]] && first=false
+
+  if $first; then
+    pamu2fcfg >"$tmp" || { rm -f "$tmp"; die "registration failed or was cancelled"; }
+    sudo mkdir -p "$(dirname "$FIDO2_AUTHFILE")"
+    sudo install -m 0644 "$tmp" "$FIDO2_AUTHFILE"
+  else
+    # -n omits the username, which is how additional keys are appended to an
+    # existing user's line.
+    pamu2fcfg -n >"$tmp" || { rm -f "$tmp"; die "registration failed or was cancelled"; }
+    # Append to the existing line rather than adding a second one: pam_u2f
+    # reads one line per user, with credentials separated by colons.
+    sudo sed -i "\$ s|\$|$(tr -d '\n' <"$tmp")|" "$FIDO2_AUTHFILE"
+  fi
+  rm -f "$tmp"
+
+  echo
+  echo -e "\e[32mRegistered.\e[0m Credentials now on file: $(grep -o ':' <"$FIDO2_AUTHFILE" | wc -l)"
+  echo "Enable the stacks you want from the YubiKey panel's System page."
+}
+
+cmd_pam_forget() {
+  echo "This removes every registered YubiKey credential from $FIDO2_AUTHFILE"
+  echo "and disables pam_u2f in sudo, polkit, login, and the lock screen."
+  read -r -p "Type 'yes' to continue: " answer
+  [[ $answer == yes ]] || { echo "Cancelled."; return 0; }
+  for svc in "${PAM_SERVICES[@]}"; do sudo "$SELF" _pam-write disable "$svc"; done
+  sudo rm -f "$FIDO2_AUTHFILE"
+  echo "Removed."
+}
+
+# ------------------------------------------------------------------ SSH
+#
+# Three separate ways a YubiKey can hold an SSH identity, and they do not
+# compete — a key can carry all three at once:
+#
+#   FIDO2  ed25519-sk / ecdsa-sk. Plain OpenSSH >= 8.2, no daemon, no PIN by
+#          default. `resident` stores the private half on the key so it can be
+#          recovered on a new machine with `ssh-keygen -K`.
+#   PIV    an RSA/EC keypair in a PIV slot, reached over PKCS#11. Works with
+#          anything that speaks PKCS#11, needs pcscd.
+#   GPG    an OpenPGP authentication subkey, exposed by gpg-agent's SSH socket.
+
+# libykcs11 understands YubiKey PIV slot naming; OpenSC is the generic
+# fallback for keys it does not recognise.
+pkcs11_module() {
+  local candidates=(/usr/lib/libykcs11.so /usr/lib64/libykcs11.so
+                    /usr/lib/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so
+                    /usr/lib/pkcs11/opensc-pkcs11.so)
+  for m in "${candidates[@]}"; do [[ -e $m ]] && { echo "$m"; return 0; }; done
+  return 1
+}
+
+gpg_agent_conf() { echo "$HOME/.gnupg/gpg-agent.conf"; }
+
+cmd_ssh_status() {
+  local keys="[]"
+  shopt -s nullglob
+  for pub in "$SSH_DIR"/*.pub; do
+    local type; type=$(awk '{print $1}' "$pub")
+    [[ $type == *-sk@openssh.com ]] || continue
+    keys=$(jq -c --arg file "$pub" --arg type "$type" \
+      --arg comment "$(awk '{ $1=""; $2=""; sub(/^[[:space:]]+/, ""); print }' "$pub")" \
+      '. + [{file:$file, type:$type, comment:$comment}]' <<<"$keys")
+  done
+  shopt -u nullglob
+
+  local module; module=$(pkcs11_module) || module=""
+  local conf; conf=$(gpg_agent_conf)
+
+  jq -n \
+    --argjson keys "$keys" \
+    --arg module "$module" \
+    --argjson inSshConfig "$(jbool grep -qi 'PKCS11Provider' "$SSH_DIR/config")" \
+    --argjson gpgSsh "$(jbool grep -qE '^[[:space:]]*enable-ssh-support' "$conf")" \
+    --arg gpgSock "$(gpgconf --list-dirs agent-ssh-socket 2>/dev/null)" \
+    --argjson envFile "$(jbool test -f "$HOME/.config/environment.d/90-omarchy-yubikey-gpg-ssh.conf")" \
+    '{skKeys:$keys, pkcs11Module:$module, pkcs11InSshConfig:$inSshConfig,
+      gpgSshEnabled:$gpgSsh, gpgSshSocket:$gpgSock, gpgSshEnvWritten:$envFile}'
+}
+
+# Terminal-only: ssh-keygen prompts for the FIDO2 PIN and waits for a touch.
+cmd_ssh_sk() {
+  local type="${1:-ed25519-sk}" resident="${2:-resident}"
+  local file="$SSH_DIR/id_${type//-/_}"
+  local opts=(-O application=ssh:omarchy)
+  [[ $resident == resident ]] && opts+=(-O resident -O verify-required)
+
+  mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+  [[ -e $file ]] && file="${file}_$(date +%Y%m%d%H%M%S)"
+
+  echo -e "\e[32mGenerating a $type SSH key backed by your YubiKey.\e[0m"
+  [[ $resident == resident ]] && echo "Stored on the key itself (resident), and a touch + PIN is required to use it."
+  echo "You will be asked for the FIDO2 PIN, then to touch the key."
+  echo
+
+  ssh-keygen -t "$type" "${opts[@]}" -f "$file" || die "key generation failed"
+
+  echo
+  echo -e "\e[32mDone.\e[0m Public key:"
+  echo
+  cat "$file.pub"
+  echo
+  echo "Add that line to the server's ~/.ssh/authorized_keys, or to GitHub/GitLab."
+  has wl-copy && { wl-copy <"$file.pub"; echo "(copied to the clipboard)"; }
+}
+
+# Recovering a resident key onto a fresh machine — the reason to make one.
+cmd_ssh_recover() {
+  mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+  echo -e "\e[32mPulling resident SSH keys off the YubiKey into $SSH_DIR.\e[0m"
+  echo "You will be asked for the FIDO2 PIN, then to touch the key."
+  echo
+  ( cd "$SSH_DIR" && ssh-keygen -K ) || die "no resident keys found, or the operation was cancelled"
+}
+
+cmd_ssh_piv() {
+  local module; module=$(pkcs11_module) || die "no PKCS#11 module found. Run: omarchy-yubikey install-deps"
+  mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+  local conf="$SSH_DIR/config"
+
+  if ! grep -qi 'PKCS11Provider' "$conf" 2>/dev/null; then
+    {
+      echo
+      echo "# YubiKey PIV via PKCS#11, added by omarchy-yubikey."
+      echo "Host *"
+      echo "  PKCS11Provider $module"
+    } >>"$conf"
+    chmod 600 "$conf"
+    echo "Added PKCS11Provider $module to $conf"
+  else
+    echo "$conf already sets a PKCS11Provider; leaving it alone."
+  fi
+
+  echo
+  echo "Public keys currently on the card:"
+  ssh-keygen -D "$module" 2>/dev/null || echo "  (none — the PIV slots hold no keypair yet)"
+}
+
+cmd_gpg_ssh() {
+  local state="${1:-on}" conf; conf=$(gpg_agent_conf)
+  local envdir="$HOME/.config/environment.d"
+  local envfile="$envdir/90-omarchy-yubikey-gpg-ssh.conf"
+  mkdir -p "$(dirname "$conf")" "$envdir"; chmod 700 "$(dirname "$conf")"
+
+  case "$state" in
+    on)
+      grep -qE '^[[:space:]]*enable-ssh-support' "$conf" 2>/dev/null || echo "enable-ssh-support" >>"$conf"
+      # SSH_AUTH_SOCK has to be set before anything asks for an agent. The UID
+      # is baked in rather than expanded, because environment.d does no
+      # command substitution and this file is per-user anyway.
+      printf 'SSH_AUTH_SOCK=%s\n' "$(gpgconf --list-dirs agent-ssh-socket)" >"$envfile"
+      gpgconf --kill gpg-agent >/dev/null 2>&1
+      gpg-connect-agent /bye >/dev/null 2>&1
+      echo "gpg-agent will now serve SSH. Log out and back in for SSH_AUTH_SOCK to take effect."
+      ;;
+    off)
+      [[ -f $conf ]] && sed -i '/^[[:space:]]*enable-ssh-support/d' "$conf"
+      rm -f "$envfile"
+      gpgconf --kill gpg-agent >/dev/null 2>&1
+      echo "Disabled. Log out and back in to drop SSH_AUTH_SOCK."
+      ;;
+    *) die "gpg-ssh: state must be on or off" ;;
+  esac
+}
+
+# ------------------------------------------------------------------ LUKS
+
+luks_devices() {
+  lsblk -rno NAME,FSTYPE 2>/dev/null | awk '$2 == "crypto_LUKS" { print "/dev/" $1 }'
+}
+
+cmd_luks_status() {
+  local out="[]"
+  while read -r dev; do
+    [[ -z $dev ]] && continue
+    # cryptsetup luksDump needs no privileges for the token list on most
+    # setups; when it does, the slot count simply comes back as 0.
+    local tokens
+    # grep -c prints 0 and exits 1 when nothing matches, so take its output
+    # and ignore its status rather than chaining a fallback onto it.
+    tokens=$(cryptsetup luksDump "$dev" 2>/dev/null | grep -ciE 'systemd-fido2')
+    out=$(jq -c --arg dev "$dev" --argjson tokens "${tokens:-0}" \
+      '. + [{device:$dev, fido2Tokens:$tokens}]' <<<"$out")
+  done <<<"$(luks_devices)"
+
+  jq -n --argjson devices "$out" --argjson tool "$(jbool has systemd-cryptenroll)" \
+    '{devices:$devices, hasCryptenroll:$tool}'
+}
+
+cmd_luks_enroll() {
+  local dev="$1"
+  [[ -n $dev ]] || dev=$(luks_devices | head -1)
+  [[ -n $dev ]] || die "no LUKS device found on this machine"
+
+  echo -e "\e[32mEnrolling your YubiKey to unlock $dev at boot.\e[0m"
+  echo "You will be asked for an existing LUKS passphrase, then to touch the key."
+  echo
+  echo -e "\e[33mKeep your passphrase.\e[0m It stays valid and is the only way in if the key is lost."
+  echo
+
+  sudo systemd-cryptenroll --fido2-device=auto "$dev" || die "enrollment failed"
+
+  echo
+  echo "Enrolled. Add 'fido2-device=auto' to this device's options in /etc/crypttab"
+  echo "(and rebuild the initramfs) so the prompt appears at boot:"
+  echo
+  echo "  sudo mkinitcpio -P"
+}
+
+# --------------------------------------------------- accounts: OATH / TOTP
+#
+# The half of "log into Gmail with my YubiKey" that a desktop can actually own.
+# The other half — registering the key as a WebAuthn security key — happens in
+# the browser on the provider's own page; `providers` below is the index of
+# those pages. TOTP secrets, though, live on the key and are readable here, so
+# Gmail, Outlook, AWS, GitHub and anything else with a shared-secret 2FA can be
+# enrolled once and read from the panel forever after.
+
+cmd_oath_list() {
+  if ! has ykman; then
+    jq -n '{locked:false, accounts:[], error:"ykman is not installed."}'
+    return 0
+  fi
+  local raw rc
+  raw=$(ykman oath accounts list 2>&1); rc=$?
+  # A key with an OATH password reports it here rather than listing nothing.
+  if [[ $rc -ne 0 ]]; then
+    if grep -qiE 'password|authentication' <<<"$raw"; then
+      jq -n '{locked:true, accounts:[], error:"The OATH applet is password protected."}'
+    else
+      jq -n --arg e "$(head -3 <<<"$raw")" '{locked:false, accounts:[], error:$e}'
+    fi
+    return 0
+  fi
+
+  jq -R -s -c '
+    split("\n") | map(select(length > 0)) | map(
+      # ykman prints "Issuer:name" when an issuer is set, bare "name" when not.
+      (. | capture("^(?<issuer>[^:]+):(?<name>.+)$") // {issuer:"", name:.})
+      | {id: (if .issuer == "" then .name else .issuer + ":" + .name end),
+         issuer: .issuer, name: .name}
+    ) | {locked:false, accounts:., error:""}' <<<"$raw"
+}
+
+# Blocks on a touch when the account was added with --touch; the panel says so
+# while it waits. The code lands on the clipboard because that is what it is
+# for, and is announced rather than printed to a window nobody is looking at.
+cmd_oath_code() {
+  require_ykman
+  local id="$1"
+  [[ -n $id ]] || die "oath-code: need an account id"
+  local out code
+  out=$(ykman oath accounts code -s "$id" 2>&1) || die "$(head -2 <<<"$out")"
+  code=$(tr -d '[:space:]' <<<"$out")
+  [[ -n $code ]] || die "no code returned for '$id'"
+
+  if has wl-copy; then
+    # --paste-once so a one-time code does not linger in the clipboard for the
+    # rest of the session.
+    printf '%s' "$code" | wl-copy --paste-once
+  fi
+  has notify-send && notify-send -a YubiKey -t 20000 "$id" "Code $code copied — valid for this period only."
+  jq -n --arg id "$id" --arg code "$code" '{id:$id, code:$code}'
+}
+
+cmd_oath_add() {
+  require_ykman
+  local issuer="$1" name="$2" secret="$3" touch="${4:-no}"
+  [[ -n $name && -n $secret ]] || die "oath-add: need <issuer> <name> <secret> [touch]"
+  # ykman prompts before overwriting a name that already exists, and a prompt
+  # from the shell process has nobody to answer it — it would hang forever.
+  # Refusing outright is also the safer answer: overwriting a TOTP account
+  # destroys the only copy of its secret.
+  local existing
+  existing=$(ykman oath accounts list 2>/dev/null)
+  local full="$name"
+  [[ -n $issuer ]] && full="$issuer:$name"
+  if grep -Fxq "$full" <<<"$existing"; then
+    die "'$full' is already on the key. Delete it first if you mean to replace it."
+  fi
+
+  local args=(oath accounts add)
+  [[ -n $issuer ]] && args+=(--issuer "$issuer")
+  [[ $touch == touch ]] && args+=(--touch)
+  # The secret is left off the argument list and fed to the prompt on stdin, so
+  # it never appears in the process table where any user on the box could read
+  # it out of /proc.
+  printf '%s\n' "$secret" | ykman "${args[@]}" "$name" \
+    || die "could not add the account (is the secret valid base32?)"
+  echo "added"
+}
+
+cmd_oath_uri() {
+  require_ykman
+  local uri="$1"
+  [[ $uri == otpauth://* ]] || die "not an otpauth:// URI"
+  ykman oath accounts uri "$uri" || die "could not add the account from that URI"
+  echo "added"
+}
+
+# Providers show the enrollment secret as a QR code and nothing else. Selecting
+# it off the screen is the difference between this being usable and being a
+# transcription exercise.
+cmd_oath_scan() {
+  require_ykman
+  for t in grim slurp zbarimg; do has "$t" || die "$t is not installed (needs grim, slurp, and zbar)"; done
+  local png uri
+  png=$(mktemp --suffix=.png)
+  grim -g "$(slurp -d)" "$png" 2>/dev/null || { rm -f "$png"; die "selection cancelled"; }
+  uri=$(zbarimg --raw -q "$png" 2>/dev/null | head -1)
+  rm -f "$png"
+  [[ -n $uri ]] || die "no QR code found in that selection"
+  cmd_oath_uri "$uri"
+}
+
+cmd_oath_delete() {
+  require_ykman
+  local id="$1"
+  [[ -n $id ]] || die "oath-delete: need an account id"
+  ykman oath accounts delete "$id" --force || die "could not delete '$id'"
+  echo "deleted"
+}
+
+# Where each provider hides its security-key and authenticator-app settings.
+# Kept in the backend so `omarchy-yubikey providers` is useful on its own and
+# the panel and CLI never disagree about the list.
+cmd_providers() {
+  jq -n '[
+    {id:"google",    name:"Google / Gmail",     icon:"󰊫",
+     url:"https://myaccount.google.com/signinoptions/passkeys",
+     note:"Add under Passkeys and security keys. Works as a passkey or as a plain security key."},
+    {id:"microsoft", name:"Microsoft / Outlook", icon:"󰠅",
+     url:"https://account.live.com/proofs/manage/additional",
+     note:"Security info > Add sign-in method > Security key. Hotmail and Outlook.com share this page."},
+    {id:"aws",       name:"AWS",                icon:"󰸏",
+     url:"https://console.aws.amazon.com/iam/home#/security_credentials",
+     note:"Security credentials > Multi-factor authentication > Passkey or security key."},
+    {id:"github",    name:"GitHub",             icon:"󰊤",
+     url:"https://github.com/settings/security",
+     note:"Two-factor authentication > Security keys. Also where SSH keys are added."},
+    {id:"proton",    name:"Proton Mail",        icon:"󰇮",
+     url:"https://account.proton.me/u/0/mail/account-password",
+     note:"Two-factor authentication > Security key."},
+    {id:"fastmail",  name:"Fastmail",           icon:"󰇮",
+     url:"https://app.fastmail.com/settings/security/2fa",
+     note:"Two-step verification > Security key."},
+    {id:"cloudflare",name:"Cloudflare",         icon:"󰅧",
+     url:"https://dash.cloudflare.com/profile/authentication",
+     note:"Authentication > Security keys."}
+  ]'
+}
+
+# --------------------------------------------------------- PINs and resets
+#
+# Every one of these prompts for something. None can run from the shell
+# process, which is why the panel reaches them through `term`.
+
+# Say what state the applet is actually in before prompting. ykman's own
+# prompts do not distinguish "setting a first PIN" from "changing an existing
+# one", and answering the wrong question costs a retry off a counter that
+# bricks the applet when it hits zero.
+cmd_pin() {
+  require_ykman
+  local app="${1:-}" rc=0
+
+  case "$app" in
+    fido2)
+      local info set retries
+      info=$(yk fido info)
+      set=$(fido_pin_set "$info")
+      retries=$(fido_pin_retries "$info")
+      if [[ $set == true ]]; then
+        echo -e "\e[32mChanging the FIDO2 PIN.\e[0m"
+        echo "A PIN is already set on this key${retries:+, with $retries attempt(s) remaining}."
+        echo "You will be asked for the current PIN as well as the new one."
+      else
+        echo -e "\e[32mSetting the FIDO2 PIN.\e[0m"
+        echo "No PIN is set on this key yet, so only the new one is asked for."
+      fi
+      echo "It must be at least 4 characters; some keys are configured to require more."
+      echo
+      ykman fido access change-pin || rc=$?
+      ;;
+    piv)           ykman piv access change-pin || rc=$? ;;
+    piv-puk)       ykman piv access change-puk || rc=$? ;;
+    piv-mgmt)      ykman piv access change-management-key --touch --generate --protect || rc=$? ;;
+    openpgp)       ykman openpgp access change-pin || rc=$? ;;
+    openpgp-admin) ykman openpgp access change-pin --admin-pin || rc=$? ;;
+    oath)          ykman oath access change || rc=$? ;;
+    *) die "pin: one of fido2, piv, piv-puk, piv-mgmt, openpgp, openpgp-admin, oath" ;;
+  esac
+
+  [[ $rc -eq 0 ]] && { echo -e "\n\e[32mDone.\e[0m"; return 0; }
+
+  # ykman's failure messages are accurate but terse, and the consequences
+  # differ wildly — a typo costs one retry, a blocked applet costs every
+  # credential on it. Spell out which one just happened.
+  echo
+  echo -e "\e[31mThat did not go through (ykman exited $rc).\e[0m"
+  echo "The message above is ykman's. The usual causes:"
+  echo "  · the current PIN was wrong — check the retry counter before trying again"
+  echo "  · the new PIN was shorter than the key's minimum, or the two entries differed"
+  echo "  · the prompt was cancelled, or the key was unplugged partway through"
+  if [[ $app == fido2 ]]; then
+    echo
+    echo "Current state:"
+    yk fido info | sed 's/^/  /'
+    echo
+    echo "If the counter has reached zero the applet is blocked, and the only way"
+    echo "back is a FIDO2 reset — which drops every passkey and site registration"
+    echo "on this key."
+  fi
+  return "$rc"
+}
+
+cmd_reset() {
+  require_ykman
+  local app="${1:-}"
+  case "$app" in fido2|piv|oath|openpgp) ;; *) die "reset: one of fido2, piv, oath, openpgp" ;; esac
+
+  echo -e "\e[31mThis wipes the $app applet on the key.\e[0m"
+  case "$app" in
+    fido2)   echo "Every site you registered this key with — Google, Microsoft, AWS, GitHub — stops recognising it." ;;
+    piv)     echo "All PIV certificates and keypairs are destroyed, including any SSH identity in a slot." ;;
+    oath)    echo "Every TOTP account stored on the key is destroyed. You will need the original secrets to re-add them." ;;
+    openpgp) echo "The OpenPGP keys on the card are destroyed. Anything encrypted only to them becomes unreadable." ;;
+  esac
+  echo "There is no undo, and no backup unless you made one yourself."
+  echo
+  read -r -p "Type 'reset $app' to confirm: " answer
+  [[ $answer == "reset $app" ]] || { echo "Cancelled."; return 0; }
+
+  ykman "$app" reset --force
+  echo -e "\n\e[32mThe $app applet has been reset.\e[0m"
+}
+
+# ---------------------------------------------------------------- doctor
+
+cmd_doctor() {
+  echo "YubiKey status"
+  echo "=============="
+  echo
+  if ! has ykman; then
+    echo "ykman is not installed. Run: omarchy-yubikey install-deps"
+    return 1
+  fi
+  ykman info 2>&1 || echo "No YubiKey detected."
+  echo
+  echo "PAM"
+  echo "---"
+  cmd_pam_status | jq -r '
+    "Registered credentials: \(.keyCount)",
+    (.services[] | "  \(.service): \(if .enabled then "enabled" else "off" end)")'
+  echo
+  echo "SSH"
+  echo "---"
+  cmd_ssh_status | jq -r '
+    "  FIDO2 keys in ~/.ssh: \(.skKeys | length)",
+    "  PKCS#11 module: \(if .pkcs11Module == "" then "none found" else .pkcs11Module end)",
+    "  gpg-agent SSH support: \(if .gpgSshEnabled then "on" else "off" end)"'
+  echo
+  echo "Accounts"
+  echo "--------"
+  cmd_oath_list | jq -r 'if .locked then "  (locked)" elif (.accounts | length) == 0 then "  none" else (.accounts[] | "  \(.id)") end'
+}
+
+# Re-run any subcommand inside a terminal window, holding it open at the end so
+# the result is readable. This is the only path for anything that prompts.
+cmd_term() {
+  [[ $# -gt 0 ]] || die "term: need a subcommand"
+  has xdg-terminal-exec || die "xdg-terminal-exec not found"
+  exec xdg-terminal-exec -- bash -c \
+    'clear; "$0" "$@"; status=$?; echo; if [[ $status -ne 0 ]]; then echo -e "\e[31mFinished with errors.\e[0m"; fi; read -n1 -r -p "Press any key to close..."' \
+    "$SELF" "$@"
+}
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-yubikey <command> [args]
+
+Reading (JSON on stdout, safe to call from anywhere)
+  status                     Devices, applets, PIN retries, PIV slots
+  present                    yes/no, straight from sysfs — fast enough to poll
+  deps                       Which supporting packages are installed
+  pam-status                 pam_u2f state for sudo, polkit, login, lock
+  ssh-status                 FIDO2 keys, PKCS#11 module, gpg-agent SSH
+  luks-status                LUKS volumes and their FIDO2 enrollments
+  oath-list                  TOTP accounts stored on the key
+  providers                  Where to register the key with each service
+  doctor                     All of the above, for humans
+
+System authentication
+  pam-enable  <sudo|polkit|login|lock>
+  pam-disable <sudo|polkit|login|lock>
+  pam-register               (prompts) Register this key with PAM
+  pam-forget                 (prompts) Remove every registration and stack
+  ssh-sk [ed25519-sk|ecdsa-sk] [resident|nonresident]   (prompts)
+  ssh-recover                (prompts) Pull resident SSH keys off the key
+  ssh-piv                    Point OpenSSH at the PIV applet over PKCS#11
+  gpg-ssh <on|off>           Use gpg-agent as the SSH agent
+  luks-enroll [device]       (prompts) Unlock a LUKS volume with the key
+
+Accounts
+  oath-code   <id>           Generate a TOTP code and copy it
+  oath-add    <issuer> <name> <secret> [touch]
+  oath-uri    <otpauth://…>
+  oath-scan                  Read an enrollment QR code off the screen
+  oath-delete <id>
+
+Hardware
+  app <applet> <on|off> [usb|nfc]    Enable or disable an applet
+  pin <fido2|piv|piv-puk|piv-mgmt|openpgp|openpgp-admin|oath>   (prompts)
+  reset <fido2|piv|oath|openpgp>     (prompts) Wipe an applet
+  install-deps               (prompts) Install the supporting packages
+
+  term <command> [args]      Run any of the above in a terminal window
+USAGE
+}
+
+case "${1:-}" in
+  status)       cmd_status ;;
+  present)      cmd_present ;;
+  deps)         cmd_deps ;;
+  install-deps) cmd_install_deps ;;
+  pam-status)   cmd_pam_status ;;
+  pam-enable)   shift; cmd_pam_enable "$@" ;;
+  pam-disable)  shift; cmd_pam_disable "$@" ;;
+  pam-register) cmd_pam_register ;;
+  pam-forget)   cmd_pam_forget ;;
+  _pam-write)   shift; cmd_pam_write "$@" ;;
+  ssh-status)   cmd_ssh_status ;;
+  ssh-sk)       shift; cmd_ssh_sk "$@" ;;
+  ssh-recover)  cmd_ssh_recover ;;
+  ssh-piv)      cmd_ssh_piv ;;
+  gpg-ssh)      shift; cmd_gpg_ssh "$@" ;;
+  luks-status)  cmd_luks_status ;;
+  luks-enroll)  shift; cmd_luks_enroll "$@" ;;
+  oath-list)    cmd_oath_list ;;
+  oath-code)    shift; cmd_oath_code "$@" ;;
+  oath-add)     shift; cmd_oath_add "$@" ;;
+  oath-uri)     shift; cmd_oath_uri "$@" ;;
+  oath-scan)    cmd_oath_scan ;;
+  oath-delete)  shift; cmd_oath_delete "$@" ;;
+  providers)    cmd_providers ;;
+  app)          shift; cmd_app "$@" ;;
+  pin)          shift; cmd_pin "$@" ;;
+  reset)        shift; cmd_reset "$@" ;;
+  doctor)       cmd_doctor ;;
+  term)         shift; cmd_term "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 1 ;;
+esac

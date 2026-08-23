@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "eusener.yubikey",
+  "name": "YubiKey",
+  "version": "1.0.0",
+  "author": "Eusener Castilho",
+  "description": "YubiKey hardware, system authentication (PAM, SSH, LUKS), and account codes",
+  "kinds": [
+    "panel",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "panel": "YubikeyPanel.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "YubiKey",
+    "description": "Shows whether a YubiKey is plugged in; opens the YubiKey panel",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
