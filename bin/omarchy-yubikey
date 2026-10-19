@@ -136,7 +136,7 @@ parse_applications() {
 
 device_json() {
   local serial="$1" info
-  info=$(yk --device "$serial" info)
+  [[ -n $serial ]] && info=$(yk --device "$serial" info)
   [[ -z $info ]] && info=$(yk info)
 
   jq -n \
@@ -247,20 +247,26 @@ cmd_status() {
     jq -n '{present:false, count:0, devices:[], pins:{}, pivSlots:[], missingTool:true}'
     return 0
   fi
-  local serials devices="[]"
+  local serials devices="[]" found=false
   serials=$(yk list --serials)
 
   if [[ -n $serials ]]; then
+    found=true
     while read -r s; do
       [[ -z $s ]] && continue
       devices=$(jq -c --argjson d "$(device_json "$s")" '. + [$d]' <<<"$devices")
     done <<<"$serials"
+  elif [[ -n $(yk list) ]]; then
+    # Security Keys (FIDO-only models) have no serial, so `--serials` prints
+    # nothing even though the key is plugged in. Report it without one.
+    found=true
+    devices=$(jq -c --argjson d "$(device_json "")" '. + [$d]' <<<"$devices")
   fi
 
   jq -n \
     --argjson devices "$devices" \
-    --argjson pins "$(if [[ -n $serials ]]; then pins_json; else echo '{}'; fi)" \
-    --argjson slots "$(if [[ -n $serials ]]; then piv_slots_json; else echo '[]'; fi)" \
+    --argjson pins "$(if $found; then pins_json; else echo '{}'; fi)" \
+    --argjson slots "$(if $found; then piv_slots_json; else echo '[]'; fi)" \
     '{present: ($devices | length > 0), count: ($devices | length),
       devices:$devices, pins:$pins, pivSlots:$slots, missingTool:false}'
 }
